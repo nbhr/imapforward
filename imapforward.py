@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import datetime
 import json
 import logging
 import signal
@@ -36,6 +37,7 @@ from imapclient import IMAPClient
 IDLE_TIMEOUT = 300  # IDLE wait in seconds (RFC 2177 recommends < 29 min)
 RECONNECT_DELAY = 10  # Initial reconnect delay in seconds
 MAX_RECONNECT_DELAY = 300  # Exponential backoff cap
+PURGE_INTERVAL = 86400  # Run done_folder purge at most once per day
 
 GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.insert"]
 
@@ -48,6 +50,7 @@ SAMPLE_CONFIG = {
         "password": "password",
         "folder": "INBOX",
         "done_folder": "DONE",
+        "done_retention_days": 365,
     },
     "destination": {
         "type": "gmail_api",
@@ -84,6 +87,7 @@ class SourceConfig:
     password: str
     folder: str = "INBOX"
     done_folder: str = ""  # Empty string disables move-after-copy
+    done_retention_days: int = 0  # 0 disables purging old messages
 
 
 @dataclass
@@ -92,6 +96,7 @@ class MirrorState:
 
     copied_uids: set[int] = field(default_factory=set)
     running: bool = True
+    last_purge: float = 0.0  # time.time() of last purge run
 
 
 # ---------------------------------------------------------------------------
@@ -338,6 +343,37 @@ def move_messages(client: IMAPClient, uids: list[int], dest_folder: str) -> None
         logger.debug("COPY+DELETE done: UID %s -> %s", uids, dest_folder)
 
 
+def purge_done_folder(client: IMAPClient, src_cfg: SourceConfig) -> int:
+    """Delete messages older than done_retention_days from done_folder.
+
+    Temporarily selects done_folder, searches for old messages,
+    deletes them, then re-selects the source folder.
+    Returns the number of deleted messages.
+    """
+    if not src_cfg.done_folder or src_cfg.done_retention_days <= 0:
+        return 0
+
+    cutoff = datetime.date.today() - datetime.timedelta(days=src_cfg.done_retention_days)
+    cutoff_str = cutoff.strftime("%d-%b-%Y")  # IMAP date format
+
+    client.select_folder(src_cfg.done_folder)
+    try:
+        uids = client.search(["BEFORE", cutoff_str])
+        if not uids:
+            return 0
+
+        client.add_flags(uids, [b"\\Deleted"])
+        client.expunge(uids)
+        logger.info(
+            "Purged %d message(s) older than %s from %s",
+            len(uids), cutoff_str, src_cfg.done_folder,
+        )
+        return len(uids)
+    finally:
+        # Re-select the source folder to resume IDLE
+        client.select_folder(src_cfg.folder)
+
+
 # ---------------------------------------------------------------------------
 # Fetch and deliver
 # ---------------------------------------------------------------------------
@@ -446,6 +482,9 @@ def mirror_loop(
                 logger.debug("IDLE timeout — sending keepalive")
                 src.noop()
                 dst.keepalive()
+                if time.time() - state.last_purge >= PURGE_INTERVAL:
+                    purge_done_folder(src, src_cfg)
+                    state.last_purge = time.time()
 
     finally:
         if src:
