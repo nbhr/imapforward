@@ -1,32 +1,42 @@
 #!/usr/bin/env python3
 """
-imapforward.py – IMAP IDLE で一方のINBOXを監視し，新着メールを他方のINBOXにコピーする．
+imap_mirror.py – IMAP IDLE で一方のINBOXを監視し，新着メールを他方にコピーする．
+
+コピー先 (destination) は IMAP または Gmail API (messages.import) を選択可能．
+Gmail API を使うと push 通知が発火する．
 
 使い方:
   1. config.json を作成（--init で雛形生成）
-  2. python imapforward.py config.json
+  2. Gmail API を使う場合:
+       pip install google-api-python-client google-auth-oauthlib
+       python imap_mirror.py config.json --auth   # 初回のみ: ブラウザで認可
+  3. python imap_mirror.py config.json
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import json
 import logging
 import signal
 import sys
 import time
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from imapclient import IMAPClient
 
 # ---------------------------------------------------------------------------
-# 設定
+# 定数
 # ---------------------------------------------------------------------------
 
 IDLE_TIMEOUT = 300  # IDLE 待機秒数（RFC 2177 は 29分以内を推奨）
 RECONNECT_DELAY = 10  # 再接続までの待機秒数
 MAX_RECONNECT_DELAY = 300  # 指数バックオフの上限
+
+GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.insert"]
 
 SAMPLE_CONFIG = {
     "source": {
@@ -39,17 +49,24 @@ SAMPLE_CONFIG = {
         "done_folder": "DONE",
     },
     "destination": {
-        "host": "imap.gmail.com",
+        "type": "gmail_api",
+        "credentials_file": "credentials.json",
+        "token_file": "token.json",
+        "never_mark_spam": True,
+    },
+    "_destination_imap_example": {
+        "type": "imap",
+        "host": "imap.example.org",
         "port": 993,
         "ssl": True,
         "username": "user@example.org",
-        "password": "app-password",
+        "password": "password",
         "folder": "INBOX",
     },
     "log_level": "INFO",
 }
 
-logger = logging.getLogger("imapforward")
+logger = logging.getLogger("imap_mirror")
 
 
 # ---------------------------------------------------------------------------
@@ -58,14 +75,14 @@ logger = logging.getLogger("imapforward")
 
 
 @dataclass
-class ServerConfig:
+class SourceConfig:
     host: str
     port: int
     ssl: bool
     username: str
     password: str
     folder: str = "INBOX"
-    done_folder: str = ""  # 空文字列なら移動しない
+    done_folder: str = ""
 
 
 @dataclass
@@ -77,33 +94,207 @@ class MirrorState:
 
 
 # ---------------------------------------------------------------------------
-# IMAP 接続ヘルパー
+# Destination 抽象クラス
 # ---------------------------------------------------------------------------
 
 
-def connect(cfg: ServerConfig) -> IMAPClient:
-    """IMAP サーバに接続してフォルダを SELECT する."""
-    logger.info("connecting: %s:%d (%s)", cfg.host, cfg.port, cfg.username)
+class Destination(ABC):
+    """コピー先の抽象インタフェース."""
+
+    @abstractmethod
+    def connect(self) -> None: ...
+
+    @abstractmethod
+    def deliver(self, raw_msg: bytes) -> None:
+        """RFC822 メッセージを配送する."""
+
+    @abstractmethod
+    def keepalive(self) -> None:
+        """接続維持のための操作."""
+
+    @abstractmethod
+    def disconnect(self) -> None: ...
+
+
+# ---------------------------------------------------------------------------
+# IMAP Destination
+# ---------------------------------------------------------------------------
+
+
+class ImapDestination(Destination):
+    def __init__(self, host: str, port: int, ssl: bool,
+                 username: str, password: str, folder: str = "INBOX",
+                 **_kwargs):
+        self.host = host
+        self.port = port
+        self.ssl = ssl
+        self.username = username
+        self.password = password
+        self.folder = folder
+        self._client: IMAPClient | None = None
+
+    def connect(self) -> None:
+        logger.info("DST 接続中 (IMAP): %s:%d", self.host, self.port)
+        self._client = IMAPClient(self.host, port=self.port, ssl=self.ssl)
+        self._client.login(self.username, self.password)
+        self._client.select_folder(self.folder)
+        logger.info("DST 接続完了: %s/%s", self.host, self.folder)
+
+    def deliver(self, raw_msg: bytes) -> None:
+        assert self._client is not None
+        self._client.append(self.folder, raw_msg, flags=(), msg_time=None)
+
+    def keepalive(self) -> None:
+        if self._client:
+            self._client.noop()
+
+    def disconnect(self) -> None:
+        if self._client:
+            try:
+                self._client.logout()
+            except Exception:
+                logger.debug("DST logout 失敗（無視）")
+            self._client = None
+
+
+# ---------------------------------------------------------------------------
+# Gmail API Destination
+# ---------------------------------------------------------------------------
+
+
+class GmailDestination(Destination):
+    def __init__(self, credentials_file: str, token_file: str,
+                 never_mark_spam: bool = True, **_kwargs):
+        self.credentials_file = credentials_file
+        self.token_file = token_file
+        self.never_mark_spam = never_mark_spam
+        self._service = None
+
+    def connect(self) -> None:
+        creds = self._load_credentials()
+        self._service = self._build_service(creds)
+        # 接続確認
+        profile = self._service.users().getProfile(userId="me").execute()
+        logger.info("DST 接続完了 (Gmail API): %s", profile.get("emailAddress"))
+
+    def deliver(self, raw_msg: bytes) -> None:
+        assert self._service is not None
+        encoded = base64.urlsafe_b64encode(raw_msg).decode("ascii")
+        body = {"raw": encoded}
+        result = self._service.users().messages().import_(
+            userId="me",
+            body=body,
+            internalDateSource="dateHeader",
+            neverMarkSpam=self.never_mark_spam,
+        ).execute()
+        logger.debug("Gmail import 完了: id=%s", result.get("id"))
+
+    def keepalive(self) -> None:
+        # HTTP ベースなので keepalive 不要
+        pass
+
+    def disconnect(self) -> None:
+        self._service = None
+
+    # -- 内部メソッド --
+
+    def _load_credentials(self):
+        from google.auth.transport.requests import Request
+        from google.oauth2.credentials import Credentials
+
+        token_path = Path(self.token_file)
+        creds = None
+        if token_path.exists():
+            creds = Credentials.from_authorized_user_file(
+                str(token_path), GMAIL_SCOPES
+            )
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            token_path.write_text(creds.to_json())
+            logger.info("Gmail トークンを更新しました")
+        if not creds or not creds.valid:
+            raise RuntimeError(
+                f"有効な認証トークンがありません: {self.token_file}\n"
+                "  --auth オプションで認可を実行してください"
+            )
+        return creds
+
+    @staticmethod
+    def _build_service(creds):
+        from googleapiclient.discovery import build
+
+        return build("gmail", "v1", credentials=creds, cache_discovery=False)
+
+    @classmethod
+    def authorize(cls, credentials_file: str, token_file: str) -> None:
+        """OAuth2 認可フローを実行し token_file に保存する.
+
+        ローカルにHTTPサーバを立てて認可コードを受け取る．
+        headless 環境では表示された URL を手元のブラウザで開き，
+        SSH ポートフォワーディングでリダイレクトを中継する．
+        """
+        from google_auth_oauthlib.flow import InstalledAppFlow
+
+        AUTH_PORT = 8085
+
+        flow = InstalledAppFlow.from_client_secrets_file(
+            credentials_file, GMAIL_SCOPES
+        )
+
+        print(f"ポート {AUTH_PORT} でリダイレクトを待ち受けます．")
+        print(f"リモートサーバの場合は別ターミナルで:")
+        print(f"  ssh -L {AUTH_PORT}:localhost:{AUTH_PORT} <server>")
+        print()
+
+        creds = flow.run_local_server(
+            port=AUTH_PORT,
+            open_browser=False,
+            authorization_prompt_message=(
+                "以下の URL をブラウザで開いて認可してください:\n{url}"
+            ),
+            success_message="認可完了！ このタブを閉じてください．",
+        )
+        Path(token_file).write_text(creds.to_json())
+        print(f"認可完了 — トークンを保存しました: {token_file}")
+
+
+# ---------------------------------------------------------------------------
+# Destination ファクトリ
+# ---------------------------------------------------------------------------
+
+
+def create_destination(cfg: dict) -> Destination:
+    dst_type = cfg.get("type", "imap")
+    params = {k: v for k, v in cfg.items() if k != "type"}
+    if dst_type == "imap":
+        return ImapDestination(**params)
+    elif dst_type == "gmail_api":
+        return GmailDestination(**params)
+    else:
+        raise ValueError(f"未対応の destination type: {dst_type}")
+
+
+# ---------------------------------------------------------------------------
+# ソース側 IMAP ヘルパー
+# ---------------------------------------------------------------------------
+
+
+def connect_source(cfg: SourceConfig) -> IMAPClient:
+    logger.info("SRC 接続中: %s:%d (%s)", cfg.host, cfg.port, cfg.username)
     client = IMAPClient(cfg.host, port=cfg.port, ssl=cfg.ssl)
     client.login(cfg.username, cfg.password)
     client.select_folder(cfg.folder)
-    logger.info("connected: %s/%s", cfg.host, cfg.folder)
+    logger.info("SRC 接続完了: %s/%s", cfg.host, cfg.folder)
     return client
 
 
 def ensure_folder(client: IMAPClient, folder: str) -> None:
-    """フォルダが存在しなければ作成する."""
     if not client.folder_exists(folder):
         client.create_folder(folder)
-        logger.info("created: %s", folder)
+        logger.info("フォルダ作成: %s", folder)
 
 
 def move_messages(client: IMAPClient, uids: list[int], dest_folder: str) -> None:
-    """メッセージを dest_folder に移動する.
-
-    MOVE 拡張 (RFC 6851) に対応していれば使い，
-    非対応なら COPY → +FLAGS \\Deleted → EXPUNGE でフォールバック.
-    """
     capabilities = client.capabilities()
     if b"MOVE" in capabilities:
         client.move(uids, dest_folder)
@@ -115,15 +306,6 @@ def move_messages(client: IMAPClient, uids: list[int], dest_folder: str) -> None
         logger.debug("COPY+DELETE 完了: UID %s → %s", uids, dest_folder)
 
 
-def safe_disconnect(client: IMAPClient | None, label: str) -> None:
-    if client is None:
-        return
-    try:
-        client.logout()
-    except Exception:
-        logger.debug("%s: logout 失敗（無視）", label)
-
-
 # ---------------------------------------------------------------------------
 # メール取得・転送
 # ---------------------------------------------------------------------------
@@ -131,41 +313,34 @@ def safe_disconnect(client: IMAPClient | None, label: str) -> None:
 
 def fetch_and_copy(
     src: IMAPClient,
-    dst: IMAPClient,
-    src_cfg: ServerConfig,
-    dst_cfg: ServerConfig,
+    dst: Destination,
+    src_cfg: SourceConfig,
     state: MirrorState,
 ) -> int:
-    """Copy UNSEEN messages on src to dst, and return the number of copied messages."""
+    """src の UNSEEN メッセージを dst に配送する．件数を返す."""
     uids = src.search(["UNSEEN"])
     if not uids:
         return 0
 
-    # Exclude messages copied before
     new_uids = [u for u in uids if u not in state.copied_uids]
     if not new_uids:
         return 0
 
-    logger.info("Detected %d new emails (UID: %s)", len(new_uids), new_uids)
+    logger.info("新着 %d 件を検出 (UID: %s)", len(new_uids), new_uids)
 
-    fetched = src.fetch(new_uids, ["RFC822", "INTERNALDATE", "FLAGS"])
+    fetched = src.fetch(new_uids, ["RFC822"])
     copied = 0
     move_targets: list[int] = []
     for uid, data in fetched.items():
         raw_msg: bytes = data[b"RFC822"]
-        internal_date = data.get(b"INTERNALDATE")
-        flags = data.get(b"FLAGS", ())
-        # \Recent は append 時に指定できないので除外
-        flags = tuple(f for f in flags if f not in (b"\\Recent", b"\\Seen"))
-
         try:
-            dst.append(dst_cfg.folder, raw_msg, flags=flags, msg_time=internal_date)
+            dst.deliver(raw_msg)
             state.copied_uids.add(uid)
             copied += 1
             move_targets.append(uid)
-            logger.info("Copied: UID %d (%d bytes)", uid, len(raw_msg))
+            logger.info("配送完了: UID %d (%d bytes)", uid, len(raw_msg))
         except Exception:
-            logger.exception("Copy failed: UID %d", uid)
+            logger.exception("配送失敗: UID %d", uid)
 
     # コピー成功分をソース側の done_folder に移動
     if move_targets and src_cfg.done_folder:
@@ -173,12 +348,11 @@ def fetch_and_copy(
             ensure_folder(src, src_cfg.done_folder)
             move_messages(src, move_targets, src_cfg.done_folder)
             logger.info(
-                "Moved: %d emails → %s", len(move_targets), src_cfg.done_folder
+                "移動完了: %d 件 → %s", len(move_targets), src_cfg.done_folder
             )
-            # INBOX から消えたので copied_uids に保持する必要がなくなる
             state.copied_uids -= set(move_targets)
         except Exception:
-            logger.exception("Move failed: %s → %s", move_targets, src_cfg.done_folder)
+            logger.exception("移動失敗: %s → %s", move_targets, src_cfg.done_folder)
 
     return copied
 
@@ -188,20 +362,19 @@ def fetch_and_copy(
 # ---------------------------------------------------------------------------
 
 
-def mirror_loop(src_cfg: ServerConfig, dst_cfg: ServerConfig, state: MirrorState):
-    """IDLE 監視 → 新着コピー のループ（1回の接続セッション分）."""
+def mirror_loop(
+    src_cfg: SourceConfig, dst: Destination, state: MirrorState
+):
     src: IMAPClient | None = None
-    dst: IMAPClient | None = None
     try:
-        src = connect(src_cfg)
-        dst = connect(dst_cfg)
+        src = connect_source(src_cfg)
+        dst.connect()
 
         # 起動直後に未読を処理
-        n = fetch_and_copy(src, dst, src_cfg, dst_cfg, state)
+        n = fetch_and_copy(src, dst, src_cfg, state)
         if n:
-            logger.info("Copied (init): %d emails", n)
+            logger.info("初回配送: %d 件", n)
 
-        sys.exit(0)
         while state.running:
             logger.debug("IDLE 開始 (timeout=%ds)", IDLE_TIMEOUT)
             src.idle()
@@ -219,27 +392,29 @@ def mirror_loop(src_cfg: ServerConfig, dst_cfg: ServerConfig, state: MirrorState
 
             if responses:
                 logger.debug("IDLE 応答: %s", responses)
-                n = fetch_and_copy(src, dst, src_cfg, dst_cfg, state)
+                n = fetch_and_copy(src, dst, src_cfg, state)
                 if n:
-                    logger.info("コピー: %d 件", n)
+                    logger.info("配送: %d 件", n)
             else:
-                # タイムアウト — NOOP で接続維持
-                logger.debug("IDLE タイムアウト — NOOP 送信")
+                logger.debug("IDLE タイムアウト — keepalive")
                 src.noop()
-                dst.noop()
+                dst.keepalive()
 
     finally:
-        safe_disconnect(src, "source")
-        safe_disconnect(dst, "destination")
+        if src:
+            try:
+                src.logout()
+            except Exception:
+                logger.debug("SRC logout 失敗（無視）")
+        dst.disconnect()
 
 
-def run(src_cfg: ServerConfig, dst_cfg: ServerConfig):
+def run(src_cfg: SourceConfig, dst: Destination):
     state = MirrorState()
     delay = RECONNECT_DELAY
 
-    # SIGINT / SIGTERM でクリーンに停止
     def _stop(signum, frame):
-        logger.info("Got signal %d - terminating", signum)
+        logger.info("シグナル %d を受信 — 停止します", signum)
         state.running = False
 
     signal.signal(signal.SIGINT, _stop)
@@ -247,22 +422,27 @@ def run(src_cfg: ServerConfig, dst_cfg: ServerConfig):
 
     while state.running:
         try:
-            mirror_loop(src_cfg, dst_cfg, state)
+            mirror_loop(src_cfg, dst, state)
         except KeyboardInterrupt:
             state.running = False
         except Exception:
-            logger.exception("Error - retry after %d sec", delay)
+            logger.exception("接続エラー — %d 秒後に再接続", delay)
             if state.running:
                 time.sleep(delay)
                 delay = min(delay * 2, MAX_RECONNECT_DELAY)
             continue
         delay = RECONNECT_DELAY
 
-    logger.info("Terminated")
+    logger.info("終了しました")
 
 
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
 
-def load_config(path: str) -> tuple[ServerConfig, ServerConfig]:
+
+def load_config(path: str) -> tuple[SourceConfig, dict]:
+    """設定ファイルを読み込み (SourceConfig, destination の生dict) を返す."""
     with open(path) as f:
         cfg = json.load(f)
 
@@ -273,33 +453,50 @@ def load_config(path: str) -> tuple[ServerConfig, ServerConfig]:
         datefmt="%Y-%m-%dT%H:%M:%S",
     )
 
-    src = ServerConfig(**cfg["source"])
-    dst = ServerConfig(**cfg["destination"])
-    return src, dst
+    src = SourceConfig(**cfg["source"])
+    return src, cfg["destination"]
 
 
 def main():
-    parser = argparse.ArgumentParser(description="IMAP INBOX forwarder")
-    parser.add_argument("config", nargs="?", help="config.json")
+    parser = argparse.ArgumentParser(description="IMAP INBOX ミラーリング")
+    parser.add_argument("config", nargs="?", help="config.json のパス")
     parser.add_argument(
-        "--init",
-        metavar="PATH",
-        help="Create an initial config and exit.",
+        "--init", metavar="PATH",
+        help="設定ファイルの雛形を生成して終了",
+    )
+    parser.add_argument(
+        "--auth", action="store_true",
+        help="Gmail API の OAuth2 認可を実行して終了",
     )
     args = parser.parse_args()
 
     if args.init:
         p = Path(args.init)
         p.write_text(json.dumps(SAMPLE_CONFIG, indent=2, ensure_ascii=False))
-        print(f"Created: {p}")
+        print(f"雛形を作成しました: {p}")
         sys.exit(0)
 
     if not args.config:
         parser.print_help()
         sys.exit(1)
 
-    src_cfg, dst_cfg = load_config(args.config)
-    run(src_cfg, dst_cfg)
+    src_cfg, dst_raw = load_config(args.config)
+
+    # --auth: Gmail API の認可フローのみ実行
+    if args.auth:
+        if dst_raw.get("type") != "gmail_api":
+            print(
+                "エラー: --auth は destination.type が gmail_api の場合のみ有効です",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        GmailDestination.authorize(
+            dst_raw["credentials_file"], dst_raw["token_file"]
+        )
+        sys.exit(0)
+
+    dst = create_destination(dst_raw)
+    run(src_cfg, dst)
 
 
 if __name__ == "__main__":
