@@ -170,10 +170,11 @@ class GmailDestination(Destination):
         self.token_file = token_file
         self.never_mark_spam = never_mark_spam
         self._service = None
+        self._creds = None
 
     def connect(self) -> None:
-        creds = self._load_credentials()
-        self._service = self._build_service(creds)
+        self._creds = self._load_credentials()
+        self._service = self._build_service(self._creds)
         logger.info("DST connected (Gmail API)")
 
     def deliver(self, raw_msg: bytes) -> None:
@@ -191,15 +192,25 @@ class GmailDestination(Destination):
             result.get("id"),
             result.get("labelIds"),
         )
+        # Persist refreshed token to disk so it survives restarts
+        self._save_credentials()
 
     def keepalive(self) -> None:
         # HTTP-based; no keepalive needed
         pass
 
     def disconnect(self) -> None:
+        # Save token one last time on disconnect
+        self._save_credentials()
         self._service = None
+        self._creds = None
 
     # -- Internal methods --
+
+    def _save_credentials(self) -> None:
+        """Write current credentials to disk if available."""
+        if self._creds is not None:
+            Path(self.token_file).write_text(self._creds.to_json())
 
     def _load_credentials(self):
         from google.auth.transport.requests import Request
