@@ -173,21 +173,23 @@ class GmailDestination(Destination):
     def connect(self) -> None:
         creds = self._load_credentials()
         self._service = self._build_service(creds)
-        # 接続確認
-        profile = self._service.users().getProfile(userId="me").execute()
-        logger.info("DST 接続完了 (Gmail API): %s", profile.get("emailAddress"))
+        logger.info("DST 接続完了 (Gmail API)")
 
     def deliver(self, raw_msg: bytes) -> None:
         assert self._service is not None
         encoded = base64.urlsafe_b64encode(raw_msg).decode("ascii")
-        body = {"raw": encoded}
+        body = {"raw": encoded, "labelIds": ["INBOX", "UNREAD"]}
         result = self._service.users().messages().import_(
             userId="me",
             body=body,
             internalDateSource="dateHeader",
             neverMarkSpam=self.never_mark_spam,
         ).execute()
-        logger.debug("Gmail import 完了: id=%s", result.get("id"))
+        logger.info(
+            "Gmail import 完了: id=%s, labels=%s",
+            result.get("id"),
+            result.get("labelIds"),
+        )
 
     def keepalive(self) -> None:
         # HTTP ベースなので keepalive 不要
@@ -229,32 +231,43 @@ class GmailDestination(Destination):
     def authorize(cls, credentials_file: str, token_file: str) -> None:
         """OAuth2 認可フローを実行し token_file に保存する.
 
-        ローカルにHTTPサーバを立てて認可コードを受け取る．
-        headless 環境では表示された URL を手元のブラウザで開き，
-        SSH ポートフォワーディングでリダイレクトを中継する．
+        ローカルサーバ不要．認可後にブラウザのアドレスバーに表示される
+        リダイレクト URL を貼り付けて認可コードを取得する．
         """
-        from google_auth_oauthlib.flow import InstalledAppFlow
+        from google_auth_oauthlib.flow import Flow
+        from urllib.parse import urlparse, parse_qs
 
-        AUTH_PORT = 8085
+        REDIRECT_URI = "http://localhost:1"  # 実際には接続しない
 
-        flow = InstalledAppFlow.from_client_secrets_file(
-            credentials_file, GMAIL_SCOPES
+        flow = Flow.from_client_secrets_file(
+            credentials_file,
+            scopes=GMAIL_SCOPES,
+            redirect_uri=REDIRECT_URI,
         )
 
-        print(f"ポート {AUTH_PORT} でリダイレクトを待ち受けます．")
-        print(f"リモートサーバの場合は別ターミナルで:")
-        print(f"  ssh -L {AUTH_PORT}:localhost:{AUTH_PORT} <server>")
+        auth_url, state = flow.authorization_url(
+            access_type="offline",
+            prompt="consent",
+        )
+
+        print("以下の URL をブラウザで開いて認可してください:\n")
+        print(auth_url)
         print()
+        print('認可後，ブラウザが "このサイトにアクセスできません" 等の')
+        print("エラーになりますが正常です．")
+        print("アドレスバーの URL 全体をコピーして貼り付けてください．")
+        print()
+        redirect_response = input("リダイレクト URL: ").strip()
 
-        creds = flow.run_local_server(
-            port=AUTH_PORT,
-            open_browser=False,
-            authorization_prompt_message=(
-                "以下の URL をブラウザで開いて認可してください:\n{url}"
-            ),
-            success_message="認可完了！ このタブを閉じてください．",
-        )
-        Path(token_file).write_text(creds.to_json())
+        # URL から認可コードを抽出
+        parsed = urlparse(redirect_response)
+        params = parse_qs(parsed.query)
+        if "code" not in params:
+            print("エラー: URL に認可コードが含まれていません", file=sys.stderr)
+            sys.exit(1)
+
+        flow.fetch_token(code=params["code"][0])
+        Path(token_file).write_text(flow.credentials.to_json())
         print(f"認可完了 — トークンを保存しました: {token_file}")
 
 
@@ -376,11 +389,19 @@ def mirror_loop(
             logger.info("初回配送: %d 件", n)
 
         while state.running:
-            logger.debug("IDLE 開始 (timeout=%ds)", IDLE_TIMEOUT)
+            logger.info("IDLE 待機中 (timeout=%ds)", IDLE_TIMEOUT)
             src.idle()
 
             try:
-                responses = src.idle_check(timeout=IDLE_TIMEOUT)
+                # 短い間隔でポーリングし，シグナル受信時に即座に抜ける
+                responses = []
+                elapsed = 0
+                while state.running and elapsed < IDLE_TIMEOUT:
+                    chunk = src.idle_check(timeout=5)
+                    if chunk:
+                        responses.extend(chunk)
+                        break
+                    elapsed += 5
             except Exception:
                 logger.warning("IDLE 中にエラー発生")
                 raise
@@ -389,6 +410,9 @@ def mirror_loop(
                     src.idle_done()
                 except Exception:
                     logger.debug("idle_done 失敗（無視）")
+
+            if not state.running:
+                break
 
             if responses:
                 logger.debug("IDLE 応答: %s", responses)
@@ -434,6 +458,7 @@ def run(src_cfg: SourceConfig, dst: Destination):
         delay = RECONNECT_DELAY
 
     logger.info("終了しました")
+    sys.exit(0)
 
 
 # ---------------------------------------------------------------------------
