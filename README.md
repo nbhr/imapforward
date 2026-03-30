@@ -26,6 +26,15 @@ pip install imapclient
 pip install google-api-python-client google-auth-oauthlib
 ```
 
+If you cannot use `pip` directly ([PEP 668](https://peps.python.org/pep-0668/)), you can use `venv` or similar, for example,
+
+```
+python3 -m venv venv
+./venv/bin/pip install -r requirements.txt
+```
+
+and in what follows, you can replace `python3 imapforward.py ...` with `./venv/bin/python3 imapforward.py ...`.
+
 ## Quick Start
 
 ```bash
