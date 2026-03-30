@@ -51,6 +51,7 @@ SAMPLE_CONFIG = {
         "folder": "INBOX",
         "done_folder": "DONE",
         "done_retention_days": 365,
+        "failed_folder": "FAILED",
     },
     "destination": {
         "type": "gmail_api",
@@ -88,6 +89,7 @@ class SourceConfig:
     folder: str = "INBOX"
     done_folder: str = ""  # Empty string disables move-after-copy
     done_retention_days: int = 0  # 0 disables purging old messages
+    failed_folder: str = ""  # Empty string leaves failed messages in source folder
 
 
 @dataclass
@@ -399,6 +401,7 @@ def fetch_and_copy(
     fetched = src.fetch(new_uids, ["RFC822"])
     copied = 0
     move_targets: list[int] = []
+    failed_targets: list[int] = []
     for uid, data in fetched.items():
         raw_msg: bytes = data[b"RFC822"]
         try:
@@ -409,6 +412,7 @@ def fetch_and_copy(
             logger.info("Delivered: UID %d (%d bytes)", uid, len(raw_msg))
         except Exception:
             logger.exception("Delivery failed: UID %d", uid)
+            failed_targets.append(uid)
 
     # Move successfully copied messages to done_folder on source
     if move_targets and src_cfg.done_folder:
@@ -423,6 +427,21 @@ def fetch_and_copy(
         except Exception:
             logger.exception(
                 "Move failed: %s -> %s", move_targets, src_cfg.done_folder
+            )
+
+    # Move failed messages to failed_folder to prevent retry loops
+    if failed_targets and src_cfg.failed_folder:
+        try:
+            ensure_folder(src, src_cfg.failed_folder)
+            move_messages(src, failed_targets, src_cfg.failed_folder)
+            logger.info(
+                "Moved %d failed message(s) -> %s",
+                len(failed_targets), src_cfg.failed_folder,
+            )
+        except Exception:
+            logger.exception(
+                "Move to failed_folder failed: %s -> %s",
+                failed_targets, src_cfg.failed_folder,
             )
 
     return copied
