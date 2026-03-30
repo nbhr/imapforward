@@ -101,6 +101,14 @@ This will print an authorization URL. Open it in a browser, sign in with your Go
 
 A `token.json` file will be created. The token is automatically refreshed on expiry; you should not need to re-authorize unless you revoke access or change scopes.
 
+### Token and credential lifetime
+
+- **`credentials.json`** is your OAuth client identity. It does not expire and can be reused indefinitely unless you delete or regenerate the client in Google Cloud Console.
+
+- **`token.json`** contains an access token (valid for ~1 hour) and a refresh token (used to obtain new access tokens). The script automatically refreshes the access token during normal operation and writes it back to `token.json` after each delivery.
+
+- **Testing vs Production mode:** If your OAuth consent screen is in **Testing** mode, refresh tokens expire after **7 days**. This means you will need to re-run `--auth` weekly. For long-term unattended operation, switch the consent screen to **Production** mode. Personal-use apps with fewer than 100 users do not require Google's verification review, or if you are using Google Workspace, set the user type to Internal - internal apps are not subject to the 7-day expiration and do not require verification.
+
 ## Configuration
 
 ### config.json
