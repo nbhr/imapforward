@@ -19,6 +19,8 @@ from __future__ import annotations
 import argparse
 import base64
 import datetime
+import email
+import email.utils
 import json
 import logging
 import signal
@@ -26,6 +28,7 @@ import sys
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
+from email.mime.text import MIMEText
 from pathlib import Path
 
 from imapclient import IMAPClient
@@ -52,6 +55,7 @@ SAMPLE_CONFIG = {
         "done_folder": "DONE",
         "done_retention_days": 365,
         "failed_folder": "FAILED",
+        "notify_on_failure": True,
     },
     "destination": {
         "type": "gmail_api",
@@ -90,6 +94,7 @@ class SourceConfig:
     done_folder: str = ""  # Empty string disables move-after-copy
     done_retention_days: int = 0  # 0 disables purging old messages
     failed_folder: str = ""  # Empty string leaves failed messages in source folder
+    notify_on_failure: bool = True  # Deliver a notice to dst when messages fail
 
 
 @dataclass
@@ -381,6 +386,34 @@ def purge_done_folder(client: IMAPClient, src_cfg: SourceConfig) -> int:
 # ---------------------------------------------------------------------------
 
 
+def build_failure_notice(
+    failed_info: list[tuple[int, str, str]],
+    src_cfg: SourceConfig,
+) -> bytes:
+    """Build an RFC822 notice listing messages that failed delivery.
+
+    failed_info: list of (uid, subject, sender) tuples.
+    Returns raw RFC822 bytes.
+    """
+    lines = []
+    for uid, subject, sender in failed_info:
+        lines.append(f"  UID {uid}: From: {sender}  Subject: {subject}")
+    body = (
+        f"{len(failed_info)} message(s) could not be delivered and "
+        f"moved to '{src_cfg.failed_folder}' on {src_cfg.host}.\n"
+        f"\n"
+        + "\n".join(lines)
+        + "\n\nPlease check the folder manually.\n"
+    )
+
+    msg = MIMEText(body, "plain", "utf-8")
+    msg["Subject"] = f"[imapforward] {len(failed_info)} delivery failure(s)"
+    msg["From"] = f"imapforward <{src_cfg.username}>"
+    msg["To"] = src_cfg.username
+    msg["Date"] = email.utils.formatdate(localtime=True)
+    return msg.as_bytes()
+
+
 def fetch_and_copy(
     src: IMAPClient,
     dst: Destination,
@@ -402,6 +435,7 @@ def fetch_and_copy(
     copied = 0
     move_targets: list[int] = []
     failed_targets: list[int] = []
+    failed_info: list[tuple[int, str, str]] = []
     for uid, data in fetched.items():
         raw_msg: bytes = data[b"RFC822"]
         try:
@@ -413,6 +447,13 @@ def fetch_and_copy(
         except Exception:
             logger.exception("Delivery failed: UID %d", uid)
             failed_targets.append(uid)
+            # Extract headers for the failure notice
+            parsed = email.message_from_bytes(raw_msg)
+            failed_info.append((
+                uid,
+                str(parsed.get("Subject", "(no subject)")),
+                str(parsed.get("From", "(unknown)")),
+            ))
 
     # Move successfully copied messages to done_folder on source
     if move_targets and src_cfg.done_folder:
@@ -443,6 +484,15 @@ def fetch_and_copy(
                 "Move to failed_folder failed: %s -> %s",
                 failed_targets, src_cfg.failed_folder,
             )
+
+    # Deliver failure notice to destination
+    if failed_info and src_cfg.notify_on_failure:
+        try:
+            notice = build_failure_notice(failed_info, src_cfg)
+            dst.deliver(notice)
+            logger.info("Failure notice delivered to destination")
+        except Exception:
+            logger.exception("Failed to deliver failure notice")
 
     return copied
 
