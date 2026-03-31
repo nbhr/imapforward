@@ -46,6 +46,8 @@ SOCKET_TIMEOUT = 60  # Timeout for individual socket operations (seconds)
 TCP_KEEPALIVE_IDLE = 60  # Seconds before first keepalive probe
 TCP_KEEPALIVE_INTERVAL = 15  # Seconds between keepalive probes
 TCP_KEEPALIVE_COUNT = 4  # Failed probes before connection is dropped
+GMAIL_HTTP_TIMEOUT = 300  # Timeout for Gmail API HTTP requests (seconds)
+GMAIL_NUM_RETRIES = 3  # Retry count for transient Gmail API errors
 
 GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.insert"]
 
@@ -204,7 +206,7 @@ class GmailDestination(Destination):
             body=body,
             internalDateSource="dateHeader",
             neverMarkSpam=self.never_mark_spam,
-        ).execute()
+        ).execute(num_retries=GMAIL_NUM_RETRIES)
         logger.info(
             "Gmail import done: id=%s, labels=%s",
             result.get("id"),
@@ -253,9 +255,14 @@ class GmailDestination(Destination):
 
     @staticmethod
     def _build_service(creds):
+        import google_auth_httplib2
+        import httplib2
         from googleapiclient.discovery import build
 
-        return build("gmail", "v1", credentials=creds, cache_discovery=False)
+        http = google_auth_httplib2.AuthorizedHttp(
+            creds, http=httplib2.Http(timeout=GMAIL_HTTP_TIMEOUT)
+        )
+        return build("gmail", "v1", http=http, cache_discovery=False)
 
     @classmethod
     def authorize(cls, credentials_file: str, token_file: str) -> None:
