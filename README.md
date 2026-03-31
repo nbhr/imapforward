@@ -12,7 +12,7 @@ Supported destinations:
 
 ### Background
 
-Existing tools such as `[imapsync](https://imapsync.lamiral.info/)` are well known for copying emails between IMAP servers. However, they operate in batch mode -- they synchronize and exit, much like `rsync`. While you can schedule them with `cron`, this approach has drawbacks: frequent runs cause repeated login/authentication overhead on the server, and there is an inherent delay bounded by the cron interval. Furthermore, messages copied via IMAP APPEND are not treated as new arrivals by the destination (e.g. Gmail does not send push notifications for them).
+Existing tools such as [`imapsync`](https://imapsync.lamiral.info/) are well known for copying emails between IMAP servers. However, they operate in batch mode -- they synchronize and exit, much like `rsync`. While you can schedule them with `cron`, this approach has drawbacks: frequent runs cause repeated login/authentication overhead on the server, and there is an inherent delay bounded by the cron interval. Furthermore, messages copied via IMAP APPEND are not treated as new arrivals by the destination (e.g. Gmail does not send push notifications for them).
 
 This script takes a different approach: it maintains a persistent IMAP connection using IDLE (RFC 2177), so new messages are detected and copied within seconds of arrival. When paired with the Gmail API destination, it can also trigger push notifications. In other words, this script is a headless, single-purpose MUA dedicated to real-time mail forwarding.
 
