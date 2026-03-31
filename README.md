@@ -1,17 +1,26 @@
 # imapforward
 
-Monitor an IMAP INBOX via IDLE and forward new messages to another destination.
+Monitor an IMAP INBOX via IDLE and forward new messages to another destination. Typical use cases include:
+
+- Situations where conventional email forwarding causes DMARC validation failures (e.g. SPF/DKIM alignment breaks when a forwarding server relays mail on behalf of the original sender)
+- Environments where server-side email forwarding is not permitted by the mail system administrator
 
 Supported destinations:
 
 - **IMAP** – Append messages to another IMAP mailbox
 - **Gmail API** – Import messages via `messages.import` with push notification support
 
+### Background
+
+Existing tools such as `[imapsync](https://imapsync.lamiral.info/)` are well known for copying emails between IMAP servers. However, they operate in batch mode -- they synchronize and exit, much like `rsync`. While you can schedule them with `cron`, this approach has drawbacks: frequent runs cause repeated login/authentication overhead on the server, and there is an inherent delay bounded by the cron interval. Furthermore, messages copied via IMAP APPEND are not treated as new arrivals by the destination (e.g. Gmail does not send push notifications for them).
+
+This script takes a different approach: it maintains a persistent IMAP connection using IDLE (RFC 2177), so new messages are detected and copied within seconds of arrival. When paired with the Gmail API destination, it can also trigger push notifications. In other words, this script is a headless, single-purpose MUA dedicated to real-time mail forwarding.
+
 ## Disclaimer
 
-- This software is provided as-is, with no warranty of any kind. Use it at your own risk.
-- Since this tool directly manipulates IMAP mailboxes — including moving and deleting messages — you should **make a complete backup of your mailbox before use**. Data loss due to misconfiguration or bugs is your responsibility.
-- The codebase is small. Please read and understand the source code before running it. If something is unclear, do not run it.
+- This software is provided as-is, with no warranty of any kind. **Use it at your own risk**.
+- Since this tool directly manipulates IMAP mailboxes -- including moving and deleting messages -- you should **make a complete backup of your mailbox before use**. Data loss due to misconfiguration or bugs is your responsibility.
+- The codebase is small. Please read and understand the source code before running it. **If something is unclear, do not run it**.
 - Bug reports and suggestions are welcome, but there is no guarantee that all issues will be addressed or resolved in a timely manner.
 - Do not share / upload your JSON files (i.e., `config.json`, `token.json`, `credentials.json`). `.gitignore` intentionally specifies `*.json` to exclude these confidential files.
 
@@ -33,6 +42,8 @@ python3 -m venv venv
 
 Then replace `python3` with `./venv/bin/python3` in the commands below.
 
+This script runs as a long-lived process that monitors the source mailbox continuously. You will need an always-on environment to run it -- for example, a home server, a Raspberry Pi, or a VPS. See [Running as a systemd service](#running-as-a-systemd-service) for how to daemonize it.
+ 
 ## Quick Start
 
 ```bash
@@ -86,7 +97,7 @@ The file should look like this:
 ```
 
 > **Note:** Make sure the top-level key is `"installed"`, not `"web"`.
-> If you see `"web"`, you selected "Web application" instead of "Desktop app" — delete and recreate.
+> If you see `"web"`, you selected "Web application" instead of "Desktop app" -- delete and recreate.
 
 ### 5. Authorize the application
 
@@ -94,7 +105,7 @@ The file should look like this:
 python3 imapforward.py config.json --auth
 ```
 
-This will print an authorization URL. Open it in a browser, sign in with your Google account, and grant access. After authorization, the browser will show a "site can't be reached" error — this is expected. Copy the entire URL from the address bar and paste it into the terminal.
+This will print an authorization URL. Open it in a browser, sign in with your Google account, and grant access. After authorization, the browser will show a "site can't be reached" error -- this is expected. Copy the entire URL from the address bar and paste it into the terminal.
 
 A `token.json` file will be created. The token is automatically refreshed on expiry; you should not need to re-authorize unless you revoke access or change scopes.
 
@@ -104,7 +115,7 @@ A `token.json` file will be created. The token is automatically refreshed on exp
 
 - **`token.json`** contains an access token (valid for ~1 hour) and a refresh token (used to obtain new access tokens). The script automatically refreshes the access token during normal operation and writes it back to `token.json` after each delivery.
 
-- **Testing vs Production mode:** If your OAuth consent screen is in **Testing** mode with user type **External**, refresh tokens expire after **7 days**. This means you will need to re-run `--auth` weekly. For long-term unattended operation, either switch the consent screen to **Production** mode (personal-use apps with fewer than 100 users do not require Google's verification review), or if you are using Google Workspace, set the user type to **Internal** — internal apps are not subject to the 7-day expiration and do not require verification.
+- **Testing vs Production mode:** If your OAuth consent screen is in **Testing** mode with user type **External**, refresh tokens expire after **7 days**. This means you will need to re-run `--auth` weekly. For long-term unattended operation, either switch the consent screen to **Production** mode (personal-use apps with fewer than 100 users do not require Google's verification review), or if you are using Google Workspace, set the user type to **Internal** -- internal apps are not subject to the 7-day expiration and do not require verification.
 
 ## Configuration
 
@@ -159,7 +170,7 @@ Generated by `--init`. The `destination` section determines the delivery method.
 > If your Google account has 2-step verification enabled, you will need to generate an
 > [app password](https://myaccount.google.com/apppasswords) and use it in place of your
 > regular password. Be aware that messages added via IMAP APPEND do not trigger push
-> notifications on Android or iOS — use the Gmail API destination if you need notifications.
+> notifications on Android or iOS -- use the Gmail API destination if you need notifications.
 
 ### Source options
 
