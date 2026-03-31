@@ -387,23 +387,28 @@ def purge_done_folder(client: IMAPClient, src_cfg: SourceConfig) -> int:
 
 
 def build_failure_notice(
-    failed_info: list[tuple[int, str, str]],
+    failed_info: list[tuple[int, str, str, str]],
     src_cfg: SourceConfig,
 ) -> bytes:
     """Build an RFC822 notice listing messages that failed delivery.
 
-    failed_info: list of (uid, subject, sender) tuples.
+    failed_info: list of (uid, subject, sender, reason) tuples.
     Returns raw RFC822 bytes.
     """
     lines = []
-    for uid, subject, sender in failed_info:
-        lines.append(f"  UID {uid}: From: {sender}  Subject: {subject}")
+    for uid, subject, sender, reason in failed_info:
+        lines.append(
+            f"  UID {uid}:\n"
+            f"    From:    {sender}\n"
+            f"    Subject: {subject}\n"
+            f"    Reason:  {reason}\n"
+        )
     body = (
         f"{len(failed_info)} message(s) could not be delivered and "
         f"moved to '{src_cfg.failed_folder}' on {src_cfg.host}.\n"
         f"\n"
         + "\n".join(lines)
-        + "\n\nPlease check the folder manually.\n"
+        + "Please check the folder manually.\n"
     )
 
     msg = MIMEText(body, "plain", "utf-8")
@@ -435,7 +440,7 @@ def fetch_and_copy(
     copied = 0
     move_targets: list[int] = []
     failed_targets: list[int] = []
-    failed_info: list[tuple[int, str, str]] = []
+    failed_info: list[tuple[int, str, str, str]] = []
     for uid, data in fetched.items():
         raw_msg: bytes = data[b"RFC822"]
         try:
@@ -444,7 +449,7 @@ def fetch_and_copy(
             copied += 1
             move_targets.append(uid)
             logger.info("Delivered: UID %d (%d bytes)", uid, len(raw_msg))
-        except Exception:
+        except Exception as exc:
             logger.exception("Delivery failed: UID %d", uid)
             failed_targets.append(uid)
             # Extract headers for the failure notice
@@ -453,6 +458,7 @@ def fetch_and_copy(
                 uid,
                 str(parsed.get("Subject", "(no subject)")),
                 str(parsed.get("From", "(unknown)")),
+                str(exc),
             ))
 
     # Move successfully copied messages to done_folder on source
