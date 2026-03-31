@@ -24,6 +24,7 @@ import email.utils
 import json
 import logging
 import signal
+import socket
 import sys
 import time
 from abc import ABC, abstractmethod
@@ -41,6 +42,10 @@ IDLE_TIMEOUT = 300  # IDLE wait in seconds (RFC 2177 recommends < 29 min)
 RECONNECT_DELAY = 10  # Initial reconnect delay in seconds
 MAX_RECONNECT_DELAY = 300  # Exponential backoff cap
 PURGE_INTERVAL = 86400  # Run done_folder purge at most once per day
+SOCKET_TIMEOUT = 60  # Timeout for individual socket operations (seconds)
+TCP_KEEPALIVE_IDLE = 60  # Seconds before first keepalive probe
+TCP_KEEPALIVE_INTERVAL = 15  # Seconds between keepalive probes
+TCP_KEEPALIVE_COUNT = 4  # Failed probes before connection is dropped
 
 GMAIL_SCOPES = ["https://www.googleapis.com/auth/gmail.insert"]
 
@@ -150,6 +155,7 @@ class ImapDestination(Destination):
         logger.info("DST connecting (IMAP): %s:%d", self.host, self.port)
         self._client = IMAPClient(self.host, port=self.port, ssl=self.ssl)
         self._client.login(self.username, self.password)
+        configure_socket(self._client)
         self._client.select_folder(self.folder)
         logger.info("DST connected: %s/%s", self.host, self.folder)
 
@@ -317,10 +323,39 @@ def create_destination(cfg: dict) -> Destination:
 # ---------------------------------------------------------------------------
 
 
+def configure_socket(client: IMAPClient) -> None:
+    """Enable TCP keepalive and set socket timeout on an IMAP connection.
+
+    TCP keepalive detects half-open connections at the OS level.
+    Socket timeout prevents indefinite blocking on send/recv.
+    """
+    sock = client._imap.socket()
+
+    # Socket-level operation timeout
+    sock.settimeout(SOCKET_TIMEOUT)
+
+    # TCP keepalive
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+    if hasattr(socket, "TCP_KEEPIDLE"):
+        # Linux
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, TCP_KEEPALIVE_IDLE)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, TCP_KEEPALIVE_INTERVAL)
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, TCP_KEEPALIVE_COUNT)
+    elif hasattr(socket, "TCP_KEEPALIVE"):
+        # macOS
+        sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPALIVE, TCP_KEEPALIVE_IDLE)
+
+    logger.debug(
+        "Socket configured: timeout=%ds, keepalive idle=%ds intvl=%ds cnt=%d",
+        SOCKET_TIMEOUT, TCP_KEEPALIVE_IDLE, TCP_KEEPALIVE_INTERVAL, TCP_KEEPALIVE_COUNT,
+    )
+
+
 def connect_source(cfg: SourceConfig) -> IMAPClient:
     logger.info("SRC connecting: %s:%d (%s)", cfg.host, cfg.port, cfg.username)
     client = IMAPClient(cfg.host, port=cfg.port, ssl=cfg.ssl)
     client.login(cfg.username, cfg.password)
+    configure_socket(client)
     client.select_folder(cfg.folder)
     logger.info("SRC connected: %s/%s", cfg.host, cfg.folder)
     return client
