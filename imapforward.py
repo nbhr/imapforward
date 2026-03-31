@@ -20,6 +20,7 @@ import argparse
 import base64
 import datetime
 import email
+import email.header
 import email.utils
 import json
 import logging
@@ -428,6 +429,18 @@ def purge_done_folder(client: IMAPClient, src_cfg: SourceConfig) -> int:
 # ---------------------------------------------------------------------------
 
 
+def decode_mime_header(value: str) -> str:
+    """Decode an RFC 2047 MIME-encoded header into a readable string."""
+    parts = email.header.decode_header(value)
+    decoded = []
+    for data, charset in parts:
+        if isinstance(data, bytes):
+            decoded.append(data.decode(charset or "utf-8", errors="replace"))
+        else:
+            decoded.append(data)
+    return "".join(decoded)
+
+
 def build_failure_notice(
     failed_info: list[tuple[int, str, str, str]],
     src_cfg: SourceConfig,
@@ -498,8 +511,8 @@ def fetch_and_copy(
             parsed = email.message_from_bytes(raw_msg)
             failed_info.append((
                 uid,
-                str(parsed.get("Subject", "(no subject)")),
-                str(parsed.get("From", "(unknown)")),
+                decode_mime_header(parsed.get("Subject", "(no subject)")),
+                decode_mime_header(parsed.get("From", "(unknown)")),
                 str(exc),
             ))
 
