@@ -12,7 +12,8 @@ ExecStart=/path/to/imapforward/venv/bin/python3 imapforward.py config.json
 # --------------------------------------
 Restart=always
 RestartSec=5
-RuntimeMaxSec=86400  # Restart daily as a safety net
+# Restart daily as a safety net
+RuntimeMaxSec=86400
 
 # Security hardening (optional)
 NoNewPrivileges=true
