@@ -605,9 +605,6 @@ def mirror_loop(
 
             if responses:
                 logger.debug("IDLE response: %s", responses)
-                n = fetch_and_copy(src, dst, src_cfg, state)
-                if n:
-                    logger.info("Delivered: %d message(s)", n)
             else:
                 logger.debug("IDLE timeout — sending keepalive")
                 src.noop()
@@ -615,6 +612,21 @@ def mirror_loop(
                 if time.time() - state.last_purge >= PURGE_INTERVAL:
                     purge_done_folder(src, src_cfg)
                     state.last_purge = time.time()
+
+            # Always check, regardless of whether IDLE reported anything.
+            #
+            # An EXISTS notification can be consumed by idle_done() or by the
+            # following noop() -- both discard their return values -- and the
+            # server will not repeat it. Checking only when `responses` is
+            # non-empty therefore let such a message sit unprocessed until the
+            # *next* message happened to arrive, which could be hours later.
+            #
+            # A SEARCH UNSEEN once per IDLE_TIMEOUT is cheap and makes the loop
+            # self-healing: a lost notification now costs at most IDLE_TIMEOUT
+            # seconds of delay instead of blocking delivery indefinitely.
+            n = fetch_and_copy(src, dst, src_cfg, state)
+            if n:
+                logger.info("Delivered: %d message(s)", n)
 
     finally:
         if src:
