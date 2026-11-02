@@ -146,6 +146,13 @@ class ImapDestination(Destination):
     def __init__(self, host: str, port: int, ssl: bool,
                  username: str, password: str, folder: str = "INBOX",
                  **_kwargs):
+        # Same reasoning as GmailDestination: create_destination() expands the
+        # whole "destination" dict, so a mistyped key would be silently ignored.
+        if _kwargs:
+            logger.warning(
+                "Unknown destination config key(s) ignored: %s",
+                ", ".join(sorted(_kwargs)),
+            )
         self.host = host
         self.port = port
         self.ssl = ssl
@@ -187,6 +194,15 @@ class ImapDestination(Destination):
 class GmailDestination(Destination):
     def __init__(self, credentials_file: str, token_file: str,
                  never_mark_spam: bool = True, **_kwargs):
+        # create_destination() expands the whole "destination" dict here, so a
+        # mistyped key (e.g. "never_mark_span") would be swallowed silently and
+        # the default used instead. Warn so the typo is visible at startup
+        # rather than being discovered when the setting turns out not to apply.
+        if _kwargs:
+            logger.warning(
+                "Unknown destination config key(s) ignored: %s",
+                ", ".join(sorted(_kwargs)),
+            )
         self.credentials_file = credentials_file
         self.token_file = token_file
         self.never_mark_spam = never_mark_spam
@@ -196,7 +212,12 @@ class GmailDestination(Destination):
     def connect(self) -> None:
         self._creds = self._load_credentials()
         self._service = self._build_service(self._creds)
-        logger.info("DST connected (Gmail API)")
+        # Log the effective value, not what the config file says: the two can
+        # differ when a key is mistyped or omitted.
+        logger.info(
+            "DST connected (Gmail API), never_mark_spam=%s",
+            self.never_mark_spam,
+        )
 
     def deliver(self, raw_msg: bytes) -> None:
         assert self._service is not None
